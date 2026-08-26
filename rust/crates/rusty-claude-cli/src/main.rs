@@ -651,6 +651,19 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
+        "plugin" | "plugins" => {
+            let action = rest.get(1).cloned();
+            let target = if rest.len() > 2 {
+                Some(rest[2..].join(" "))
+            } else {
+                None
+            };
+            Ok(CliAction::Plugins {
+                action,
+                target,
+                output_format,
+            })
+        }
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -769,6 +782,8 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "bootstrap-plan"
             | "agents"
             | "mcp"
+            | "plugin"
+            | "plugins"
             | "skills"
             | "system-prompt"
             | "init"
@@ -8225,6 +8240,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
+    writeln!(
+        out,
+        "  claw plugin [list|install <target>|enable <name>|disable <name>|uninstall <id>|update <id>|marketplace <add <source>|remove <name>|list>]"
+    )?;
     writeln!(out, "  claw skills")?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
     writeln!(out, "  claw init")?;
@@ -8308,6 +8327,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp show my-server")?;
+    writeln!(
+        out,
+        "  claw plugin marketplace add anthropics/claude-plugins-community"
+    )?;
+    writeln!(out, "  claw plugin install <plugin-name>@claude-community")?;
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw doctor")?;
     writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
@@ -9240,6 +9264,54 @@ mod tests {
                 .expect("agents help should parse"),
             CliAction::Agents {
                 args: Some("--help".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_plugin_and_plugins_subcommands() {
+        assert_eq!(
+            parse_args(&["plugin".to_string()]).expect("plugin should parse"),
+            CliAction::Plugins {
+                action: None,
+                target: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["plugins".to_string(), "list".to_string()])
+                .expect("plugins list should parse"),
+            CliAction::Plugins {
+                action: Some("list".to_string()),
+                target: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "plugin".to_string(),
+                "install".to_string(),
+                "hello-plugin@claude-community".to_string(),
+            ])
+            .expect("plugin install should parse"),
+            CliAction::Plugins {
+                action: Some("install".to_string()),
+                target: Some("hello-plugin@claude-community".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "plugin".to_string(),
+                "marketplace".to_string(),
+                "add".to_string(),
+                "anthropics/claude-plugins-community".to_string(),
+            ])
+            .expect("plugin marketplace add should parse"),
+            CliAction::Plugins {
+                action: Some("marketplace".to_string()),
+                target: Some("add anthropics/claude-plugins-community".to_string()),
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -10232,6 +10304,9 @@ mod tests {
         assert!(help.contains("claw acp [serve]"));
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw mcp"));
+        assert!(help.contains("claw plugin ["));
+        assert!(help.contains("claw plugin marketplace add anthropics/claude-plugins-community"));
+        assert!(help.contains("claw plugin install <plugin-name>@claude-community"));
         assert!(help.contains("claw skills"));
         assert!(help.contains("claw /skills"));
         assert!(help.contains("ultraworkers/claw-code"));

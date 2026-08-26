@@ -105,6 +105,125 @@ fn inventory_commands_emit_structured_json_when_requested() {
     let skills = assert_json_command(&root, &["--output-format", "json", "skills"]);
     assert_eq!(skills["kind"], "skills");
     assert_eq!(skills["action"], "list");
+
+    let plugins = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "plugin", "list"],
+        &[
+            ("HOME", isolated_home.to_str().expect("utf8 home")),
+            (
+                "CLAW_CONFIG_HOME",
+                isolated_config.to_str().expect("utf8 config home"),
+            ),
+            (
+                "CODEX_HOME",
+                isolated_codex.to_str().expect("utf8 codex home"),
+            ),
+        ],
+    );
+    assert_eq!(plugins["kind"], "plugin");
+    assert_eq!(plugins["action"], "list");
+}
+
+#[test]
+fn plugin_marketplace_add_and_install_round_trip_via_cli() {
+    let root = unique_temp_dir("plugin-marketplace-cli");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let isolated_home = root.join("home");
+    let isolated_config = root.join("config-home");
+    let isolated_codex = root.join("codex-home");
+    fs::create_dir_all(&isolated_home).expect("isolated home should exist");
+    let envs = [
+        ("HOME", isolated_home.to_str().expect("utf8 home")),
+        (
+            "CLAW_CONFIG_HOME",
+            isolated_config.to_str().expect("utf8 config home"),
+        ),
+        (
+            "CODEX_HOME",
+            isolated_codex.to_str().expect("utf8 codex home"),
+        ),
+    ];
+
+    let marketplace_root = root.join("marketplace-source");
+    let plugin_root = marketplace_root.join("plugins").join("hello-plugin");
+    fs::create_dir_all(marketplace_root.join(".claude-plugin")).expect("marketplace manifest dir");
+    fs::write(
+        marketplace_root
+            .join(".claude-plugin")
+            .join("marketplace.json"),
+        r#"{
+  "name": "claude-community",
+  "plugins": [
+    {"name": "hello-plugin", "source": "./plugins/hello-plugin"}
+  ]
+}"#,
+    )
+    .expect("write marketplace manifest");
+    fs::create_dir_all(plugin_root.join(".claude-plugin")).expect("plugin manifest dir");
+    fs::write(
+        plugin_root.join(".claude-plugin").join("plugin.json"),
+        r#"{
+  "name": "hello-plugin",
+  "version": "1.0.0",
+  "description": "Sample marketplace plugin"
+}"#,
+    )
+    .expect("write plugin manifest");
+
+    let add = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "plugin",
+            "marketplace",
+            "add",
+            marketplace_root.to_str().expect("utf8 marketplace path"),
+        ],
+        &envs,
+    );
+    assert_eq!(add["kind"], "plugin");
+    assert_eq!(add["action"], "marketplace");
+    assert!(add["message"]
+        .as_str()
+        .expect("marketplace add message")
+        .contains("claude-community"));
+
+    let list_marketplaces = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "plugin", "marketplace", "list"],
+        &envs,
+    );
+    assert!(list_marketplaces["message"]
+        .as_str()
+        .expect("marketplace list message")
+        .contains("claude-community"));
+
+    let install = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "plugin",
+            "install",
+            "hello-plugin@claude-community",
+        ],
+        &envs,
+    );
+    assert_eq!(install["action"], "install");
+    assert!(install["message"]
+        .as_str()
+        .expect("install message")
+        .contains("installed hello-plugin@claude-community"));
+
+    let list =
+        assert_json_command_with_env(&root, &["--output-format", "json", "plugin", "list"], &envs);
+    assert!(list["message"]
+        .as_str()
+        .expect("plugin list message")
+        .contains("hello-plugin"));
 }
 
 #[test]

@@ -22,6 +22,8 @@ const SETTINGS_FILE_NAME: &str = "settings.json";
 const REGISTRY_FILE_NAME: &str = "installed.json";
 const MANIFEST_FILE_NAME: &str = "plugin.json";
 const MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
+const MARKETPLACE_REGISTRY_FILE_NAME: &str = "marketplaces.json";
+const MARKETPLACE_MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/marketplace.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -357,6 +359,33 @@ fn default_tool_permission_label() -> String {
 pub enum PluginInstallSource {
     LocalPath { path: PathBuf },
     GitUrl { url: String },
+    Marketplace { marketplace: String, plugin: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplaceRecord {
+    pub name: String,
+    pub source: PluginInstallSource,
+    pub added_at_unix_ms: u128,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplaceRegistry {
+    #[serde(default)]
+    pub marketplaces: BTreeMap<String, MarketplaceRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceManifest {
+    name: String,
+    #[serde(default)]
+    plugins: Vec<MarketplacePluginEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplacePluginEntry {
+    name: String,
+    source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1116,20 +1145,23 @@ impl PluginManager {
     }
 
     pub fn install(&mut self, source: &str) -> Result<InstallOutcome, PluginError> {
-        let install_source = parse_install_source(source)?;
+        let install_source = parse_install_source(source, &self.load_marketplace_registry()?)?;
         let temp_root = self.install_root().join(".tmp");
-        let staged_source = materialize_source(&install_source, &temp_root)?;
-        let cleanup_source = matches!(install_source, PluginInstallSource::GitUrl { .. });
-        let manifest = load_plugin_from_directory(&staged_source)?;
+        let materialized = self.materialize_source(&install_source, &temp_root)?;
+        let manifest = load_plugin_from_directory(&materialized.root)?;
 
-        let plugin_id = plugin_id(&manifest.name, EXTERNAL_MARKETPLACE);
+        let marketplace_label = match &install_source {
+            PluginInstallSource::Marketplace { marketplace, .. } => marketplace.as_str(),
+            _ => EXTERNAL_MARKETPLACE,
+        };
+        let plugin_id = plugin_id(&manifest.name, marketplace_label);
         let install_path = self.install_root().join(sanitize_plugin_id(&plugin_id));
         if install_path.exists() {
             fs::remove_dir_all(&install_path)?;
         }
-        copy_dir_all(&staged_source, &install_path)?;
-        if cleanup_source {
-            let _ = fs::remove_dir_all(&staged_source);
+        copy_dir_all(&materialized.root, &install_path)?;
+        if let Some(cleanup_root) = &materialized.cleanup_root {
+            let _ = fs::remove_dir_all(cleanup_root);
         }
 
         let now = unix_time_ms();
@@ -1203,16 +1235,15 @@ impl PluginManager {
         })?;
 
         let temp_root = self.install_root().join(".tmp");
-        let staged_source = materialize_source(&record.source, &temp_root)?;
-        let cleanup_source = matches!(record.source, PluginInstallSource::GitUrl { .. });
-        let manifest = load_plugin_from_directory(&staged_source)?;
+        let materialized = self.materialize_source(&record.source, &temp_root)?;
+        let manifest = load_plugin_from_directory(&materialized.root)?;
 
         if record.install_path.exists() {
             fs::remove_dir_all(&record.install_path)?;
         }
-        copy_dir_all(&staged_source, &record.install_path)?;
-        if cleanup_source {
-            let _ = fs::remove_dir_all(&staged_source);
+        copy_dir_all(&materialized.root, &record.install_path)?;
+        if let Some(cleanup_root) = &materialized.cleanup_root {
+            let _ = fs::remove_dir_all(cleanup_root);
         }
 
         let updated_record = InstalledPluginRecord {
@@ -1251,7 +1282,10 @@ impl PluginManager {
                 || install_path.display().to_string(),
                 |record| describe_install_source(&record.source),
             );
-            match load_plugin_definition(&install_path, kind, source.clone(), kind.marketplace()) {
+            let marketplace_label = matched_record.map_or(kind.marketplace(), |record| {
+                record_marketplace_label(record)
+            });
+            match load_plugin_definition(&install_path, kind, source.clone(), marketplace_label) {
                 Ok(plugin) => {
                     if seen_ids.insert(plugin.metadata().id.clone()) {
                         seen_paths.insert(install_path);
@@ -1283,7 +1317,7 @@ impl PluginManager {
                 &record.install_path,
                 record.kind,
                 source.clone(),
-                record.kind.marketplace(),
+                record_marketplace_label(record),
             ) {
                 Ok(plugin) => {
                     if seen_ids.insert(plugin.metadata().id.clone()) {
@@ -1480,6 +1514,125 @@ impl PluginManager {
         }
         fs::write(path, serde_json::to_string_pretty(registry)?)?;
         Ok(())
+    }
+
+    /// Register a plugin marketplace source (a git repository, `owner/repo`
+    /// GitHub shorthand, or local directory) so plugins inside it can later
+    /// be installed via `<plugin-name>@<marketplace-name>`.
+    ///
+    /// The registered name comes from the marketplace's own
+    /// `.claude-plugin/marketplace.json` manifest when present, falling back
+    /// to a name derived from the source itself.
+    pub fn add_marketplace(&mut self, source: &str) -> Result<MarketplaceRecord, PluginError> {
+        let install_source = parse_marketplace_source(source)?;
+        let temp_root = self.install_root().join(".tmp");
+        let materialized = materialize_plain_source(&install_source, &temp_root)?;
+        let name = match load_marketplace_manifest(&materialized.root)? {
+            Some(manifest) if !manifest.name.trim().is_empty() => manifest.name,
+            _ => default_marketplace_name(&install_source),
+        };
+        if let Some(cleanup_root) = &materialized.cleanup_root {
+            let _ = fs::remove_dir_all(cleanup_root);
+        }
+
+        let record = MarketplaceRecord {
+            name: name.clone(),
+            source: install_source,
+            added_at_unix_ms: unix_time_ms(),
+        };
+        let mut registry = self.load_marketplace_registry()?;
+        registry.marketplaces.insert(name, record.clone());
+        self.store_marketplace_registry(&registry)?;
+        Ok(record)
+    }
+
+    pub fn remove_marketplace(&mut self, name: &str) -> Result<(), PluginError> {
+        let mut registry = self.load_marketplace_registry()?;
+        registry.marketplaces.remove(name).ok_or_else(|| {
+            PluginError::NotFound(format!("marketplace `{name}` is not registered"))
+        })?;
+        self.store_marketplace_registry(&registry)
+    }
+
+    pub fn list_marketplaces(&self) -> Result<Vec<MarketplaceRecord>, PluginError> {
+        Ok(self
+            .load_marketplace_registry()?
+            .marketplaces
+            .into_values()
+            .collect())
+    }
+
+    fn marketplace_record(&self, name: &str) -> Result<MarketplaceRecord, PluginError> {
+        self.load_marketplace_registry()?
+            .marketplaces
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                PluginError::NotFound(format!(
+                    "marketplace `{name}` is not registered; run `plugin marketplace add <source>` first"
+                ))
+            })
+    }
+
+    fn marketplace_registry_path(&self) -> PathBuf {
+        self.config
+            .config_home
+            .join("plugins")
+            .join(MARKETPLACE_REGISTRY_FILE_NAME)
+    }
+
+    fn load_marketplace_registry(&self) -> Result<MarketplaceRegistry, PluginError> {
+        let path = self.marketplace_registry_path();
+        match fs::read_to_string(&path) {
+            Ok(contents) if contents.trim().is_empty() => Ok(MarketplaceRegistry::default()),
+            Ok(contents) => Ok(serde_json::from_str(&contents)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(MarketplaceRegistry::default())
+            }
+            Err(error) => Err(PluginError::Io(error)),
+        }
+    }
+
+    fn store_marketplace_registry(
+        &self,
+        registry: &MarketplaceRegistry,
+    ) -> Result<(), PluginError> {
+        let path = self.marketplace_registry_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, serde_json::to_string_pretty(registry)?)?;
+        Ok(())
+    }
+
+    /// Materialize an install source into a local directory ready to copy
+    /// from. Unlike [`materialize_plain_source`], this also resolves
+    /// [`PluginInstallSource::Marketplace`] sources by looking up the
+    /// registered marketplace and finding the named plugin inside it.
+    fn materialize_source(
+        &self,
+        source: &PluginInstallSource,
+        temp_root: &Path,
+    ) -> Result<MaterializedSource, PluginError> {
+        match source {
+            PluginInstallSource::Marketplace {
+                marketplace,
+                plugin,
+            } => {
+                let record = self.marketplace_record(marketplace)?;
+                let materialized_marketplace = materialize_plain_source(&record.source, temp_root)?;
+                let plugin_root = resolve_marketplace_plugin_dir(
+                    &materialized_marketplace.root,
+                    plugin,
+                    marketplace,
+                )?;
+                Ok(MaterializedSource {
+                    root: plugin_root,
+                    cleanup_root: materialized_marketplace.cleanup_root,
+                })
+            }
+            other => materialize_plain_source(other, temp_root),
+        }
     }
 
     fn write_enabled_state(
@@ -2137,7 +2290,36 @@ fn resolve_local_source(source: &str) -> Result<PathBuf, PluginError> {
     }
 }
 
-fn parse_install_source(source: &str) -> Result<PluginInstallSource, PluginError> {
+/// Split a `<plugin>@<marketplace>` install target into its two halves.
+///
+/// Returns `None` when the string doesn't look like a marketplace
+/// reference (no `@`, an empty half, or either half containing a path
+/// separator — which rules out things like `git@github.com:owner/repo.git`).
+fn split_marketplace_target(source: &str) -> Option<(&str, &str)> {
+    let (plugin, marketplace) = source.rsplit_once('@')?;
+    if plugin.is_empty() || marketplace.is_empty() {
+        return None;
+    }
+    let has_path_separator = |value: &str| value.contains('/') || value.contains('\\');
+    if has_path_separator(plugin) || has_path_separator(marketplace) {
+        return None;
+    }
+    Some((plugin, marketplace))
+}
+
+fn parse_install_source(
+    source: &str,
+    marketplaces: &MarketplaceRegistry,
+) -> Result<PluginInstallSource, PluginError> {
+    if let Some((plugin, marketplace)) = split_marketplace_target(source) {
+        if marketplaces.marketplaces.contains_key(marketplace) {
+            return Ok(PluginInstallSource::Marketplace {
+                marketplace: marketplace.to_string(),
+                plugin: plugin.to_string(),
+            });
+        }
+    }
+
     if source.starts_with("http://")
         || source.starts_with("https://")
         || source.starts_with("git@")
@@ -2155,13 +2337,132 @@ fn parse_install_source(source: &str) -> Result<PluginInstallSource, PluginError
     }
 }
 
-fn materialize_source(
+/// Parse a marketplace source: a full git URL, a `git@` SSH remote, an
+/// `owner/repo` GitHub shorthand, or an existing local directory.
+fn parse_marketplace_source(source: &str) -> Result<PluginInstallSource, PluginError> {
+    if source.starts_with("http://") || source.starts_with("https://") || source.starts_with("git@")
+    {
+        return Ok(PluginInstallSource::GitUrl {
+            url: source.to_string(),
+        });
+    }
+
+    let path = Path::new(source);
+    if path.exists() {
+        return Ok(PluginInstallSource::LocalPath {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let segments: Vec<&str> = source.split('/').collect();
+    if segments.len() == 2 && segments.iter().all(|segment| !segment.is_empty()) {
+        return Ok(PluginInstallSource::GitUrl {
+            url: format!("https://github.com/{source}.git"),
+        });
+    }
+
+    Err(PluginError::NotFound(format!(
+        "marketplace source `{source}` was not found; expected an `owner/repo` shorthand, a git URL, or an existing local path"
+    )))
+}
+
+fn default_marketplace_name(source: &PluginInstallSource) -> String {
+    match source {
+        PluginInstallSource::LocalPath { path } => path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "marketplace".to_string()),
+        PluginInstallSource::GitUrl { url } => {
+            let trimmed = url.trim_end_matches('/');
+            let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+            trimmed
+                .rsplit(['/', ':'])
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("marketplace")
+                .to_string()
+        }
+        PluginInstallSource::Marketplace { marketplace, .. } => marketplace.clone(),
+    }
+}
+
+fn load_marketplace_manifest(root: &Path) -> Result<Option<MarketplaceManifest>, PluginError> {
+    let path = root.join(MARKETPLACE_MANIFEST_RELATIVE_PATH);
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(serde_json::from_str(&contents)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(PluginError::Io(error)),
+    }
+}
+
+/// Resolve the on-disk directory for `plugin` inside a materialized
+/// marketplace root. Prefers the marketplace's own manifest (matching
+/// entries by name and following their declared `source` path); falls back
+/// to scanning immediate subdirectories for a plugin whose directory name or
+/// manifest name matches when no marketplace manifest is present.
+fn resolve_marketplace_plugin_dir(
+    marketplace_root: &Path,
+    plugin: &str,
+    marketplace: &str,
+) -> Result<PathBuf, PluginError> {
+    if let Some(manifest) = load_marketplace_manifest(marketplace_root)? {
+        let entry = manifest
+            .plugins
+            .iter()
+            .find(|entry| entry.name == plugin)
+            .ok_or_else(|| {
+                PluginError::NotFound(format!(
+                    "plugin `{plugin}` was not found in marketplace `{marketplace}`"
+                ))
+            })?;
+        let relative = entry.source.trim_start_matches("./");
+        let resolved = marketplace_root.join(relative);
+        return if resolved.exists() {
+            Ok(resolved)
+        } else {
+            Err(PluginError::NotFound(format!(
+                "marketplace `{marketplace}` lists plugin `{plugin}` at `{}`, but that path does not exist",
+                entry.source
+            )))
+        };
+    }
+
+    for dir in discover_plugin_dirs(marketplace_root)? {
+        if dir.file_name().and_then(|name| name.to_str()) == Some(plugin) {
+            return Ok(dir);
+        }
+        if let Ok(manifest) = load_plugin_from_directory(&dir) {
+            if manifest.name == plugin {
+                return Ok(dir);
+            }
+        }
+    }
+
+    Err(PluginError::NotFound(format!(
+        "plugin `{plugin}` was not found in marketplace `{marketplace}`"
+    )))
+}
+
+struct MaterializedSource {
+    root: PathBuf,
+    cleanup_root: Option<PathBuf>,
+}
+
+/// Materialize a [`PluginInstallSource::LocalPath`] or
+/// [`PluginInstallSource::GitUrl`] into a local directory. Marketplace
+/// sources must be resolved via [`PluginManager::materialize_source`]
+/// instead, since resolving them requires the marketplace registry.
+fn materialize_plain_source(
     source: &PluginInstallSource,
     temp_root: &Path,
-) -> Result<PathBuf, PluginError> {
+) -> Result<MaterializedSource, PluginError> {
     fs::create_dir_all(temp_root)?;
     match source {
-        PluginInstallSource::LocalPath { path } => Ok(path.clone()),
+        PluginInstallSource::LocalPath { path } => Ok(MaterializedSource {
+            root: path.clone(),
+            cleanup_root: None,
+        }),
         PluginInstallSource::GitUrl { url } => {
             static MATERIALIZE_COUNTER: AtomicU64 = AtomicU64::new(0);
             let unique = MATERIALIZE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2183,8 +2484,14 @@ fn materialize_source(
                     String::from_utf8_lossy(&output.stderr).trim()
                 )));
             }
-            Ok(destination)
+            Ok(MaterializedSource {
+                root: destination.clone(),
+                cleanup_root: Some(destination),
+            })
         }
+        PluginInstallSource::Marketplace { .. } => Err(PluginError::InvalidManifest(
+            "nested marketplace install sources are not supported".to_string(),
+        )),
     }
 }
 
@@ -2220,11 +2527,35 @@ fn sanitize_plugin_id(plugin_id: &str) -> String {
         .collect()
 }
 
+/// The marketplace component of a plugin id for an installed record: the
+/// registered marketplace name for a `Marketplace`-sourced install, or the
+/// plugin kind's fixed marketplace label otherwise (`builtin`/`bundled`/
+/// `external`).
+fn record_marketplace_label(record: &InstalledPluginRecord) -> &str {
+    match &record.source {
+        PluginInstallSource::Marketplace { marketplace, .. } => marketplace.as_str(),
+        _ => record.kind.marketplace(),
+    }
+}
+
 fn describe_install_source(source: &PluginInstallSource) -> String {
     match source {
         PluginInstallSource::LocalPath { path } => path.display().to_string(),
         PluginInstallSource::GitUrl { url } => url.clone(),
+        PluginInstallSource::Marketplace {
+            marketplace,
+            plugin,
+        } => {
+            format!("{plugin}@{marketplace}")
+        }
     }
+}
+
+/// Human-readable description of an install source, exposed for callers
+/// (such as `/plugin marketplace` rendering) outside this crate.
+#[must_use]
+pub fn describe_plugin_install_source(source: &PluginInstallSource) -> String {
+    describe_install_source(source)
 }
 
 fn unix_time_ms() -> u128 {
@@ -2938,6 +3269,200 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    fn write_marketplace_manifest(root: &Path, name: &str, plugins: &[(&str, &str)]) {
+        let entries = plugins
+            .iter()
+            .map(|(plugin_name, source)| {
+                format!("    {{\"name\": \"{plugin_name}\", \"source\": \"{source}\"}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        write_file(
+            root.join(MARKETPLACE_MANIFEST_RELATIVE_PATH).as_path(),
+            &format!("{{\n  \"name\": \"{name}\",\n  \"plugins\": [\n{entries}\n  ]\n}}"),
+        );
+    }
+
+    #[test]
+    fn add_marketplace_uses_manifest_name_over_source_derived_name() {
+        let _guard = env_guard();
+        let config_home = temp_dir("home");
+        let marketplace_root = temp_dir("market");
+        write_marketplace_manifest(&marketplace_root, "claude-community", &[]);
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let record = manager
+            .add_marketplace(marketplace_root.to_str().expect("utf8 path"))
+            .expect("add_marketplace should succeed");
+        assert_eq!(record.name, "claude-community");
+
+        let listed = manager
+            .list_marketplaces()
+            .expect("list_marketplaces should succeed");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "claude-community");
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(marketplace_root);
+    }
+
+    #[test]
+    fn add_marketplace_derives_name_from_source_without_manifest() {
+        let _guard = env_guard();
+        let config_home = temp_dir("home");
+        let marketplace_root = temp_dir("plain-market");
+        fs::create_dir_all(&marketplace_root).expect("marketplace dir");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let record = manager
+            .add_marketplace(marketplace_root.to_str().expect("utf8 path"))
+            .expect("add_marketplace should succeed");
+        assert_eq!(
+            record.name,
+            marketplace_root
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(marketplace_root);
+    }
+
+    #[test]
+    fn install_resolves_plugin_by_name_from_registered_marketplace() {
+        let _guard = env_guard();
+        let config_home = temp_dir("home");
+        let marketplace_root = temp_dir("market");
+        write_marketplace_manifest(
+            &marketplace_root,
+            "claude-community",
+            &[("hello-plugin", "./plugins/hello-plugin")],
+        );
+        write_external_plugin(
+            &marketplace_root.join("plugins").join("hello-plugin"),
+            "hello-plugin",
+            "1.0.0",
+        );
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .add_marketplace(marketplace_root.to_str().expect("utf8 path"))
+            .expect("add_marketplace should succeed");
+
+        let install = manager
+            .install("hello-plugin@claude-community")
+            .expect("install from marketplace should succeed");
+        assert_eq!(install.plugin_id, "hello-plugin@claude-community");
+        assert!(manager
+            .list_plugins()
+            .expect("list plugins")
+            .iter()
+            .any(|plugin| plugin.metadata.id == "hello-plugin@claude-community" && plugin.enabled));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(marketplace_root);
+    }
+
+    #[test]
+    fn install_falls_back_to_flat_directory_scan_when_marketplace_has_no_manifest() {
+        let _guard = env_guard();
+        let config_home = temp_dir("home");
+        let marketplace_root = temp_dir("flat-market");
+        write_external_plugin(
+            &marketplace_root.join("hello-plugin"),
+            "hello-plugin",
+            "1.0.0",
+        );
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let added = manager
+            .add_marketplace(marketplace_root.to_str().expect("utf8 path"))
+            .expect("add_marketplace should succeed");
+
+        let install = manager
+            .install(&format!("hello-plugin@{}", added.name))
+            .expect("install from flat marketplace should succeed");
+        assert_eq!(install.plugin_id, format!("hello-plugin@{}", added.name));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(marketplace_root);
+    }
+
+    #[test]
+    fn install_reports_missing_plugin_in_marketplace() {
+        let _guard = env_guard();
+        let config_home = temp_dir("home");
+        let marketplace_root = temp_dir("market");
+        write_marketplace_manifest(&marketplace_root, "claude-community", &[]);
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .add_marketplace(marketplace_root.to_str().expect("utf8 path"))
+            .expect("add_marketplace should succeed");
+
+        let error = manager
+            .install("missing-plugin@claude-community")
+            .expect_err("missing plugin should error");
+        assert!(error.to_string().contains("missing-plugin"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(marketplace_root);
+    }
+
+    #[test]
+    fn install_by_name_at_unregistered_marketplace_falls_back_to_local_path_error() {
+        let _guard = env_guard();
+        let config_home = temp_dir("home");
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let error = manager
+            .install("some-plugin@not-a-registered-marketplace")
+            .expect_err("unregistered marketplace target should fail like an unknown path");
+        assert!(error
+            .to_string()
+            .contains("some-plugin@not-a-registered-marketplace"));
+
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn remove_marketplace_forgets_registered_entry() {
+        let _guard = env_guard();
+        let config_home = temp_dir("home");
+        let marketplace_root = temp_dir("market");
+        write_marketplace_manifest(&marketplace_root, "claude-community", &[]);
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .add_marketplace(marketplace_root.to_str().expect("utf8 path"))
+            .expect("add_marketplace should succeed");
+        manager
+            .remove_marketplace("claude-community")
+            .expect("remove_marketplace should succeed");
+        assert!(manager
+            .list_marketplaces()
+            .expect("list_marketplaces should succeed")
+            .is_empty());
+        assert!(manager.remove_marketplace("claude-community").is_err());
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(marketplace_root);
+    }
+
+    #[test]
+    fn add_marketplace_expands_owner_repo_shorthand_to_github_url() {
+        let source = parse_marketplace_source("anthropics/claude-plugins-community")
+            .expect("shorthand should parse");
+        assert_eq!(
+            source,
+            PluginInstallSource::GitUrl {
+                url: "https://github.com/anthropics/claude-plugins-community.git".to_string(),
+            }
+        );
     }
 
     #[test]

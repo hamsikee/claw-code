@@ -4,7 +4,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
+use plugins::{
+    describe_plugin_install_source, MarketplaceRecord, PluginError, PluginLoadFailure,
+    PluginManager, PluginSummary,
+};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
     ScopedMcpServerConfig, Session,
@@ -1376,7 +1379,7 @@ pub fn validate_slash_command_input(
         }
         "export" => SlashCommand::Export { path: remainder },
         "session" => parse_session_command(&args)?,
-        "plugin" | "plugins" | "marketplace" => parse_plugin_command(&args)?,
+        "plugin" | "plugins" | "marketplace" => parse_plugin_command(command, &args)?,
         "agents" => SlashCommand::Agents {
             args: parse_list_or_help_args(command, remainder)?,
         },
@@ -1678,7 +1681,16 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
     }
 }
 
-fn parse_plugin_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+fn parse_plugin_command(
+    command: &str,
+    args: &[&str],
+) -> Result<SlashCommand, SlashCommandParseError> {
+    // `/marketplace` is a direct shorthand for `/plugin marketplace`: its own
+    // arguments are marketplace sub-actions (add/remove/list), not top-level
+    // plugin actions.
+    if command == "marketplace" {
+        return parse_plugin_marketplace_command(args);
+    }
     match args {
         [] => Ok(SlashCommand::Plugins {
             action: None,
@@ -1734,12 +1746,49 @@ fn parse_plugin_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParse
             "plugin",
             "/plugin update <id>",
         )),
+        ["marketplace", rest @ ..] => parse_plugin_marketplace_command(rest),
         [action, ..] => Err(command_error(
             &format!(
-                "Unknown /plugin action '{action}'. Use list, install <path>, enable <name>, disable <name>, uninstall <id>, or update <id>."
+                "Unknown /plugin action '{action}'. Use list, install <path>, enable <name>, disable <name>, uninstall <id>, update <id>, or marketplace <add|remove|list>."
             ),
             "plugin",
-            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
+            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>|marketplace <add <source>|remove <name>|list>]",
+        )),
+    }
+}
+
+fn parse_plugin_marketplace_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    match args {
+        [] | ["list"] => Ok(SlashCommand::Plugins {
+            action: Some("marketplace".to_string()),
+            target: Some("list".to_string()),
+        }),
+        ["list", ..] => Err(command_error(
+            "Unexpected arguments for /plugin marketplace list.",
+            "plugin",
+            "/plugin marketplace list",
+        )),
+        ["add"] => Err(usage_error("plugin marketplace add", "<source>")),
+        ["add", target @ ..] => Ok(SlashCommand::Plugins {
+            action: Some("marketplace".to_string()),
+            target: Some(format!("add {}", target.join(" "))),
+        }),
+        ["remove"] => Err(usage_error("plugin marketplace remove", "<name>")),
+        ["remove", name] => Ok(SlashCommand::Plugins {
+            action: Some("marketplace".to_string()),
+            target: Some(format!("remove {name}")),
+        }),
+        ["remove", ..] => Err(command_error(
+            "Unexpected arguments for /plugin marketplace remove.",
+            "plugin",
+            "/plugin marketplace remove <name>",
+        )),
+        [other, ..] => Err(command_error(
+            &format!(
+                "Unknown /plugin marketplace action '{other}'. Use add <source>, remove <name>, or list."
+            ),
+            "plugin",
+            "/plugin marketplace [add <source>|remove <name>|list]",
         )),
     }
 }
@@ -2287,13 +2336,80 @@ pub fn handle_plugins_slash_command(
                 reload_runtime: true,
             })
         }
+        Some("marketplace") => {
+            let target = target.unwrap_or("");
+            let mut parts = target.splitn(2, ' ');
+            let sub_action = parts.next().unwrap_or("");
+            let rest = parts.next().map(str::trim).filter(|value| !value.is_empty());
+            match sub_action {
+                "" | "list" => {
+                    let marketplaces = manager.list_marketplaces()?;
+                    Ok(PluginsCommandResult {
+                        message: render_marketplaces_report(&marketplaces),
+                        reload_runtime: false,
+                    })
+                }
+                "add" => {
+                    let Some(source) = rest else {
+                        return Ok(PluginsCommandResult {
+                            message: "Usage: /plugins marketplace add <source>".to_string(),
+                            reload_runtime: false,
+                        });
+                    };
+                    let record = manager.add_marketplace(source)?;
+                    Ok(PluginsCommandResult {
+                        message: format!(
+                            "Plugins\n  Result           marketplace added\n  Name             {}\n  Source           {}",
+                            record.name,
+                            describe_plugin_install_source(&record.source),
+                        ),
+                        reload_runtime: false,
+                    })
+                }
+                "remove" => {
+                    let Some(name) = rest else {
+                        return Ok(PluginsCommandResult {
+                            message: "Usage: /plugins marketplace remove <name>".to_string(),
+                            reload_runtime: false,
+                        });
+                    };
+                    manager.remove_marketplace(name)?;
+                    Ok(PluginsCommandResult {
+                        message: format!("Plugins\n  Result           marketplace removed {name}"),
+                        reload_runtime: false,
+                    })
+                }
+                other => Ok(PluginsCommandResult {
+                    message: format!(
+                        "Unknown /plugins marketplace action '{other}'. Use add <source>, remove <name>, or list."
+                    ),
+                    reload_runtime: false,
+                }),
+            }
+        }
         Some(other) => Ok(PluginsCommandResult {
             message: format!(
-                "Unknown /plugins action '{other}'. Use list, install, enable, disable, uninstall, or update."
+                "Unknown /plugins action '{other}'. Use list, install, enable, disable, uninstall, update, or marketplace."
             ),
             reload_runtime: false,
         }),
     }
+}
+
+fn render_marketplaces_report(marketplaces: &[MarketplaceRecord]) -> String {
+    let mut lines = vec!["Plugin marketplaces".to_string()];
+    if marketplaces.is_empty() {
+        lines.push("  No marketplaces registered.".to_string());
+    } else {
+        for marketplace in marketplaces {
+            lines.push(format!(
+                "  {name:<20} {source}",
+                name = marketplace.name,
+                source = describe_plugin_install_source(&marketplace.source),
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
@@ -4548,6 +4664,58 @@ mod tests {
     }
 
     #[test]
+    fn plugin_marketplace_slash_command_parses_add_list_remove() {
+        assert_eq!(
+            SlashCommand::parse("/plugin marketplace add anthropics/claude-plugins-community"),
+            Ok(Some(SlashCommand::Plugins {
+                action: Some("marketplace".to_string()),
+                target: Some("add anthropics/claude-plugins-community".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/plugin marketplace list"),
+            Ok(Some(SlashCommand::Plugins {
+                action: Some("marketplace".to_string()),
+                target: Some("list".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/plugin marketplace remove claude-community"),
+            Ok(Some(SlashCommand::Plugins {
+                action: Some("marketplace".to_string()),
+                target: Some("remove claude-community".to_string()),
+            }))
+        );
+
+        // `/marketplace` is a direct shorthand: its own arguments are
+        // marketplace sub-actions, not top-level plugin actions.
+        assert_eq!(
+            SlashCommand::parse("/marketplace add anthropics/claude-plugins-community"),
+            Ok(Some(SlashCommand::Plugins {
+                action: Some("marketplace".to_string()),
+                target: Some("add anthropics/claude-plugins-community".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/marketplace"),
+            Ok(Some(SlashCommand::Plugins {
+                action: Some("marketplace".to_string()),
+                target: Some("list".to_string()),
+            }))
+        );
+    }
+
+    #[test]
+    fn plugin_marketplace_slash_command_rejects_unknown_action() {
+        let error = parse_error_message("/plugin marketplace bogus");
+        assert!(error.contains("Unknown /plugin marketplace action 'bogus'"));
+        assert!(error.contains("Use add <source>, remove <name>, or list."));
+
+        let usage_error = parse_error_message("/plugin marketplace add");
+        assert!(usage_error.contains("Usage: /plugin marketplace add <source>"));
+    }
+
+    #[test]
     fn rejects_invalid_agents_arguments() {
         // given
         let agents_input = "/agents show planner";
@@ -5608,6 +5776,76 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn registers_marketplace_and_installs_plugin_by_name() {
+        let config_home = temp_dir("marketplace-home");
+        let marketplace_root = temp_dir("marketplace-source");
+        fs::create_dir_all(marketplace_root.join(".claude-plugin")).expect("manifest dir");
+        fs::write(
+            marketplace_root
+                .join(".claude-plugin")
+                .join("marketplace.json"),
+            r#"{
+  "name": "claude-community",
+  "plugins": [
+    {"name": "hello-plugin", "source": "./plugins/hello-plugin"}
+  ]
+}"#,
+        )
+        .expect("write marketplace manifest");
+        write_external_plugin(
+            &marketplace_root.join("plugins").join("hello-plugin"),
+            "hello-plugin",
+            "1.0.0",
+        );
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        let add = handle_plugins_slash_command(
+            Some("marketplace"),
+            Some(&format!(
+                "add {}",
+                marketplace_root.to_str().expect("utf8 path")
+            )),
+            &mut manager,
+        )
+        .expect("marketplace add should succeed");
+        assert!(!add.reload_runtime);
+        assert!(add.message.contains("marketplace added"));
+        assert!(add.message.contains("Name             claude-community"));
+
+        let list = handle_plugins_slash_command(Some("marketplace"), Some("list"), &mut manager)
+            .expect("marketplace list should succeed");
+        assert!(list.message.contains("claude-community"));
+
+        let install = handle_plugins_slash_command(
+            Some("install"),
+            Some("hello-plugin@claude-community"),
+            &mut manager,
+        )
+        .expect("install from marketplace should succeed");
+        assert!(install
+            .message
+            .contains("installed hello-plugin@claude-community"));
+
+        let installed = handle_plugins_slash_command(Some("list"), None, &mut manager)
+            .expect("list command should succeed");
+        assert!(installed.message.contains("hello-plugin"));
+        assert!(installed.message.contains("enabled"));
+
+        let remove = handle_plugins_slash_command(
+            Some("marketplace"),
+            Some("remove claude-community"),
+            &mut manager,
+        )
+        .expect("marketplace remove should succeed");
+        assert!(remove
+            .message
+            .contains("marketplace removed claude-community"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(marketplace_root);
     }
 
     #[test]
